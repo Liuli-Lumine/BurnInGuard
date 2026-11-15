@@ -1,0 +1,36 @@
+name: build
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup MinGW-w64
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: mingw-w64-x86_64-gcc
+
+      - name: Build
+        shell: msys2 {0}
+        run: |
+          cd src
+          windres -i BurnInGuard.rc -o BurnInGuard_res.o
+          g++ -std=c++17 -O2 -municode -mwindows -static -Wall \
+              -o ../BurnInGuard.exe BurnInGuard.cpp BurnInGuard_res.o \
+              -lcomctl32 -lshell32 -luser32 -lgdi32 -ladvapi32
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: BurnInGuard
+          path: BurnInGuard.exe
+          if-no-files-found: error
