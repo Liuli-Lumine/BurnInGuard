@@ -86,6 +86,7 @@ struct Target
     DWORD phaseStart;
     DWORD lastSeen;
     bool fs;
+    DWORD fsNext;
 };
 
 // ---------- globals ----------
@@ -528,33 +529,55 @@ static bool GetFrameBounds(HWND h, RECT* r)
     return GetWindowRect(h, r) != 0;
 }
 
-static bool FullscreenOn(HMONITOR hmon, const RECT& mon)
+static bool IsIgnorableWindow(HWND h)
 {
-    HWND fg = GetForegroundWindow();
-    if (!fg) return false;
-    if (fg == g_msgWnd || fg == g_settingsWnd) return false;
+    if (h == g_msgWnd || h == g_settingsWnd) return true;
 
     wchar_t cls[128];
-    if (!GetClassNameW(fg, cls, 128)) return false;
-    if (!_wcsicmp(cls, L"BurnInGuardOverlay")) return false;
-    if (!_wcsicmp(cls, L"Progman") || !_wcsicmp(cls, L"WorkerW")) return false;
-    if (!_wcsicmp(cls, L"Shell_TrayWnd") || !_wcsicmp(cls, L"Shell_SecondaryTrayWnd")) return false;
+    if (!GetClassNameW(h, cls, 128)) return true;
+    if (!_wcsicmp(cls, L"BurnInGuardOverlay")) return true;
+    if (!_wcsicmp(cls, L"Progman") || !_wcsicmp(cls, L"WorkerW")) return true;
+    if (!_wcsicmp(cls, L"Shell_TrayWnd") || !_wcsicmp(cls, L"Shell_SecondaryTrayWnd")) return true;
+    return false;
+}
 
-    if (!IsWindowVisible(fg) || IsIconic(fg)) return false;
-    if (MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST) != hmon) return false;
-
+static bool CoversMonitor(HWND h, const RECT& mon)
+{
     RECT r;
-    if (!GetFrameBounds(fg, &r)) return false;
+    if (!GetFrameBounds(h, &r)) return false;
 
     RECT in;
     if (!IntersectRect(&in, &r, &mon)) return false;
+
     double monArea = (double)(mon.right - mon.left) * (double)(mon.bottom - mon.top);
     if (monArea <= 0) return false;
     double cover = (double)(in.right - in.left) * (double)(in.bottom - in.top) / monArea;
-    if (cover >= 0.95) return true;
+    return cover >= 0.95;
+}
 
-    // 独占全屏（D3D flip）窗口有时报告的范围略小于屏幕，用系统状态兜底
-    return QueryUserNotificationState() == 3; // QUNS_RUNNING_D3D_FULL_SCREEN
+static bool FullscreenOn(HMONITOR hmon, const RECT& mon)
+{
+    // 1) 按 Z 序扫描最上层的窗口：覆盖整块屏、且没有标题栏。
+    //    不要求它在前台——VRChat 这类无边框全屏经常被别的窗口抢走焦点。
+    for (HWND h = GetTopWindow(nullptr); h; h = GetWindow(h, GW_HWNDNEXT))
+    {
+        if (!IsWindowVisible(h) || IsIconic(h)) continue;
+        if (IsIgnorableWindow(h)) continue;
+
+        LONG_PTR style = GetWindowLongPtrW(h, GWL_STYLE);
+        if (style & WS_CAPTION) continue;      // 有标题栏 = 普通窗口（含"最大化"），不算全屏
+
+        if (MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST) != hmon) continue;
+        if (CoversMonitor(h, mon)) return true;
+    }
+
+    // 2) 独占全屏（D3D flip）：窗口几何可能不可靠，用系统状态兜底
+    HWND fg = GetForegroundWindow();
+    if (fg && MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST) == hmon &&
+        QueryUserNotificationState() == 3)          // QUNS_RUNNING_D3D_FULL_SCREEN
+        return true;
+
+    return false;
 }
 
 // ---------- master switch ----------
@@ -590,6 +613,32 @@ static void RefreshTargets(bool force)
     g_lastEnum = now;
 
     EnumMons();
+
+    // 显示设备编号会因为驱动重建拓扑而变化（开关 DSR、驱动重启、换线等），
+    // 配置里存的名字可能一个都对不上。这时回退到"所有非主显示器"，避免静默失效。
+    if (!g_selected.empty() && !g_mons.empty())
+    {
+        bool anyMatch = false;
+        for (size_t i = 0; i < g_selected.size() && !anyMatch; i++)
+            for (size_t m = 0; m < g_mons.size(); m++)
+                if (_wcsicmp(g_selected[i].c_str(), g_mons[m].device.c_str()) == 0) { anyMatch = true; break; }
+
+        if (!anyMatch)
+        {
+            g_selected.clear();
+            for (size_t m = 0; m < g_mons.size(); m++)
+                if (!g_mons[m].primary) g_selected.push_back(g_mons[m].device);
+            if (g_selected.empty()) g_selected.push_back(g_mons[0].device);
+
+            std::wstring names;
+            for (size_t i = 0; i < g_selected.size(); i++)
+            {
+                if (i) names += L", ";
+                names += g_selected[i];
+            }
+            Log(L"selection lost (device names changed), fallback to: %ls", names.c_str());
+        }
+    }
 
     for (int i = (int)g_targets.size() - 1; i >= 0; i--)
     {
@@ -630,6 +679,7 @@ static void RefreshTargets(bool force)
         t->phaseStart = 0;
         t->lastSeen = now;
         t->fs = false;
+        t->fsNext = 0;
         g_targets.push_back(t);
         Log(L"added %ls", g_mons[m].Label().c_str());
     }
@@ -1145,13 +1195,18 @@ static LRESULT CALLBACK MsgProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
             {
                 Target* t = g_targets[i];
 
-                bool full = g_fsGuard && FullscreenOn(t->mon.hmon, t->mon.rect);
-                if (full != t->fs)
+                // 全屏判定比较贵（要遍历 Z 序），每 500ms 算一次就够
+                if ((long)(now - t->fsNext) >= 0)
                 {
-                    t->fs = full;
-                    Log(L"%ls fullscreen=%d", t->mon.device.c_str(), full ? 1 : 0);
+                    t->fsNext = now + 500;
+                    bool full = g_fsGuard && FullscreenOn(t->mon.hmon, t->mon.rect);
+                    if (full != t->fs)
+                    {
+                        t->fs = full;
+                        Log(L"%ls fullscreen=%d", t->mon.device.c_str(), full ? 1 : 0);
+                    }
                 }
-                if (full)
+                if (t->fs)
                 {
                     // 有程序在这块屏上全屏/独占全屏，永不变暗；同时把空闲计时推后，
                     // 免得退出全屏的瞬间立刻变黑
