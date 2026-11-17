@@ -15,7 +15,8 @@ if errorlevel 1 (
 
 echo [1/2] 编译资源...
 pushd src
-windres -i BurnInGuard.rc -o BurnInGuard_res.o
+rem -c 65001: 资源脚本是 UTF-8，里面含中文说明
+windres -c 65001 -i BurnInGuard.rc -o BurnInGuard_res.o
 if errorlevel 1 (popd & exit /b 1)
 
 echo [2/2] 编译程序...

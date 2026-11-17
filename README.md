@@ -117,11 +117,13 @@ CRT 上画面骤然全黑非常突兀，容易让人以为显示器坏了。这�
 
 ```bat
 cd src
-windres -i BurnInGuard.rc -o BurnInGuard_res.o
+windres -c 65001 -i BurnInGuard.rc -o BurnInGuard_res.o
 g++ -std=c++17 -O2 -municode -mwindows -static -o ../BurnInGuard.exe ^
     BurnInGuard.cpp BurnInGuard_res.o ^
     -lcomctl32 -lshell32 -luser32 -lgdi32 -ladvapi32
 ```
+
+> `-c 65001` 是必需的：资源脚本用 UTF-8 保存，里面有中文的版本信息，不加这个参数 windres 会按 ANSI 解码成乱码。
 
 或者直接运行 `build.bat`。产物是**单个 exe**，约 650 KB，导入表里只有 Windows 自带的系统 DLL（`kernel32` / `user32` / `gdi32` / `comctl32` / `shell32` / `advapi32` / `msvcrt`），不依赖 .NET 或任何运行时。
 

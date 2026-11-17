@@ -23,7 +23,7 @@ jobs:
         shell: msys2 {0}
         run: |
           cd src
-          windres -i BurnInGuard.rc -o BurnInGuard_res.o
+          windres -c 65001 -i BurnInGuard.rc -o BurnInGuard_res.o
           g++ -std=c++17 -O2 -municode -mwindows -static -Wall \
               -o ../BurnInGuard.exe BurnInGuard.cpp BurnInGuard_res.o \
               -lcomctl32 -lshell32 -luser32 -lgdi32 -ladvapi32
